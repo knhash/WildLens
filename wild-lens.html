@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Wild Lens</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body { background: #000; overflow: hidden; }
+
+    #canvas { display: block; width: 100vw; height: 100vh; }
+
+    #label {
+      position: fixed;
+      top: 28px; left: 50%;
+      transform: translateX(-50%);
+      font-family: 'Space Mono', monospace;
+      font-size: 13px;
+      letter-spacing: 0.32em;
+      color: rgba(255,255,255,0);
+      text-transform: uppercase;
+      pointer-events: none;
+      white-space: nowrap;
+      text-shadow: 0 1px 12px rgba(0,0,0,0.9);
+      transition: color 0.35s ease;
+    }
+    #label.show { color: rgba(255,255,255,0.95); }
+
+    #bar {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      padding: 14px 28px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: linear-gradient(transparent, rgba(0,0,0,0.72));
+      pointer-events: none;
+      font-family: 'Space Mono', monospace;
+    }
+
+    #wordmark {
+      font-size: 11px;
+      letter-spacing: 0.32em;
+      color: rgba(255,255,255,0.55);
+    }
+
+    #hint {
+      font-size: 11px;
+      color: rgba(255,255,255,0.72);
+      letter-spacing: 0.05em;
+    }
+
+    kbd {
+      display: inline-block;
+      border: 1px solid rgba(255,255,255,0.45);
+      border-radius: 2px;
+      padding: 0 5px;
+      font-family: 'Space Mono', monospace;
+      font-size: 10px;
+      color: rgba(255,255,255,0.88);
+      line-height: 1.6;
+      background: rgba(255,255,255,0.08);
+    }
+
+    .sep { color: rgba(255,255,255,0.30); margin: 0 8px; }
+  </style>
+</head>
+<body>
+
+<canvas id="canvas"></canvas>
+<div id="label"></div>
+<div id="bar">
+  <span id="wordmark">WILD LENS</span>
+  <span id="hint">
+    <kbd>1</kbd> Human &nbsp;
+    <kbd>2</kbd> Dog &nbsp;
+    <kbd>3</kbd> Eagle &nbsp;
+    <kbd>4</kbd> Cat &nbsp;
+    <kbd>5</kbd> Bee
+    <span class="sep">|</span>
+    <kbd>←</kbd> <kbd>→</kbd> Scene
+  </span>
+</div>
+
+<script>
+'use strict';
+
+/* ─── Canvas + WebGL ────────────────────────────────────────── */
+const canvas = document.getElementById('canvas');
+const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+if (!gl) { document.body.textContent = 'WebGL not supported'; throw 0; }
+
+let W = 0, H = 0;
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  gl.viewport(0, 0, W, H);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ─── GLSL ──────────────────────────────────────────────────── */
+const VS = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+  v_uv = vec2(a_pos.x * 0.5 + 0.5, a_pos.y * 0.5 + 0.5);
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+const FS = `
+precision mediump float;
+varying vec2 v_uv;
+
+uniform sampler2D u_tex;
+uniform vec2  u_texSize;
+uniform float u_vidAspect;
+uniform float u_scrAspect;
+
+/* filter params */
+uniform mat3  u_colorMat;
+uniform float u_sat;
+uniform float u_uvI;
+uniform float u_sharp;
+uniform float u_vigStr;
+uniform float u_vigSlit;
+uniform float u_fish;
+uniform float u_bloom;
+uniform float u_edge;
+
+/* mosaic (bee) */
+uniform float u_mosaic;
+uniform float u_mosaicScale;
+
+/* transition params */
+uniform float u_fade;
+uniform float u_blur;
+uniform float u_flash;
+
+/* cover-mode UV: video fills screen, preserving aspect ratio */
+vec2 coverUV(vec2 uv) {
+  float r = u_vidAspect / u_scrAspect;
+  if (r > 1.0) {
+    uv.x = 0.5 + (uv.x - 0.5) / r;
+  } else {
+    uv.y = 0.5 + (uv.y - 0.5) * r;
+  }
+  return uv;
+}
+
+vec3 sampleTex(vec2 uv) {
+  return texture2D(u_tex, coverUV(uv)).rgb;
+}
+
+/* 9-tap weighted blur — used during filter lens-swap transition */
+vec3 blur9(vec2 uv, float str) {
+  vec2 d = (1.0 / u_texSize) * str * 26.0;
+  vec3 c  = sampleTex(uv) * 4.0;
+  c += sampleTex(uv + vec2( d.x,  0.0)) * 2.0;
+  c += sampleTex(uv + vec2(-d.x,  0.0)) * 2.0;
+  c += sampleTex(uv + vec2( 0.0,  d.y)) * 2.0;
+  c += sampleTex(uv + vec2( 0.0, -d.y)) * 2.0;
+  c += sampleTex(uv + vec2( d.x,  d.y));
+  c += sampleTex(uv + vec2(-d.x,  d.y));
+  c += sampleTex(uv + vec2( d.x, -d.y));
+  c += sampleTex(uv + vec2(-d.x, -d.y));
+  return c / 16.0;
+}
+
+/* unsharp-mask style sharpen — used for eagle */
+vec3 sharpen(vec2 uv) {
+  vec2 ts = 1.0 / u_texSize;
+  vec3 c = sampleTex(uv) * 9.0;
+  c -= sampleTex(uv + vec2(-ts.x, -ts.y));
+  c -= sampleTex(uv + vec2( 0.0,  -ts.y));
+  c -= sampleTex(uv + vec2( ts.x, -ts.y));
+  c -= sampleTex(uv + vec2(-ts.x,  0.0 ));
+  c -= sampleTex(uv + vec2( ts.x,  0.0 ));
+  c -= sampleTex(uv + vec2(-ts.x,  ts.y));
+  c -= sampleTex(uv + vec2( 0.0,   ts.y));
+  c -= sampleTex(uv + vec2( ts.x,  ts.y));
+  return c;
+}
+
+/* hex mosaic — snaps UV to nearest hex cell centre */
+vec2 hexMosaic(vec2 uv, float scale) {
+  vec2 asp = vec2(u_scrAspect, 1.0);
+  vec2 p   = uv * asp * scale;
+
+  /* two candidate grids offset by half a cell */
+  vec2 gA = floor(p / vec2(1.0, 0.866)) + 0.5;
+  vec2 gB = floor((p - vec2(0.5, 0.433)) / vec2(1.0, 0.866)) + 0.5;
+  gB += vec2(0.5, 0.433);
+
+  vec2 cA = vec2(gA.x, gA.y * 0.866);
+  vec2 cB = vec2(gB.x, gB.y * 0.866);
+
+  /* pick whichever centre is closer */
+  vec2 centre = (distance(p, cA) < distance(p, cB)) ? cA : cB;
+  return centre / (asp * scale);
+}
+
+void main() {
+  vec2 uv = v_uv;
+
+  /* ── Hex mosaic (bee) — quantise UV first, before fisheye ── */
+  if (u_mosaic > 0.01) {
+    uv = mix(uv, hexMosaic(uv, u_mosaicScale), u_mosaic);
+  }
+
+  /* ── Barrel/fisheye distortion ───────────────────────────── */
+  if (abs(u_fish) > 0.001) {
+    vec2 c = uv - 0.5;
+    uv = 0.5 + c * (1.0 + u_fish * dot(c, c));
+  }
+
+  /* ── Sample frame ───────────────────────────────────── */
+  vec3 col = u_blur > 0.01 ? blur9(uv, u_blur) : sampleTex(uv);
+
+  /* ── Sharpening (eagle) ─────────────────────────────── */
+  if (u_sharp > 0.01) {
+    vec3 sharp = sharpen(uv);
+    col = mix(col, sharp, u_sharp * 0.44);
+    col = clamp(col, 0.0, 1.0);
+  }
+
+  /* ── Color matrix (dichromat / channel remap) ───────── */
+  col = u_colorMat * col;
+  col = clamp(col, 0.0, 1.0);
+
+  /* ── Saturation ─────────────────────────────────────── */
+  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  col = mix(vec3(lum), col, u_sat);
+
+  /* ── UV overlay: violet bloom on bright areas (eagle) ── */
+  if (u_uvI > 0.01) {
+    float b = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    float mask = smoothstep(0.38, 0.88, b);
+    col = mix(col, col + vec3(0.42, 0.04, 0.72) * mask, u_uvI);
+    col = clamp(col, 0.0, 1.0);
+  }
+
+  /* ── Tapetum bloom: green-white glow on highlights (cat) */
+  if (u_bloom > 0.01) {
+    float b = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    float glow = smoothstep(0.50, 1.0, b);
+    col += vec3(0.10, 0.48, 0.24) * glow * u_bloom;
+    col = clamp(col, 0.0, 1.0);
+  }
+
+  /* ── Sobel edge enhance: motion-contrast channels (cat) ─ */
+  if (u_edge > 0.01) {
+    vec2 ts = 2.0 / u_texSize;
+    vec3 lw = vec3(0.2126, 0.7152, 0.0722);
+    float tl = dot(sampleTex(uv + vec2(-ts.x, -ts.y)), lw);
+    float tr = dot(sampleTex(uv + vec2( ts.x, -ts.y)), lw);
+    float bl = dot(sampleTex(uv + vec2(-ts.x,  ts.y)), lw);
+    float br = dot(sampleTex(uv + vec2( ts.x,  ts.y)), lw);
+    float gx = (tr + br) - (tl + bl);
+    float gy = (tl + tr) - (bl + br);
+    float edge = sqrt(gx*gx + gy*gy);
+    col += vec3(0.06, 0.38, 0.16) * edge * u_edge;
+    col = clamp(col, 0.0, 1.0);
+  }
+
+  /* ── Vignette ───────────────────────────────────────── */
+  if (u_vigStr > 0.01) {
+    vec2 ctr = v_uv - 0.5;   /* screen-space center */
+    float vig;
+
+    if (u_vigSlit > 0.5) {
+      /* Slit pupil (cat): dark on left/right, curving with y */
+      float xa    = abs(ctr.x);
+      float slit  = smoothstep(0.10, 0.48, xa - abs(ctr.y) * 0.22);
+      float outer = smoothstep(0.42, 0.50, length(ctr));
+      vig = max(slit, outer);
+    } else {
+      /* Circular vignette */
+      vig = smoothstep(0.30, 0.70, length(ctr * vec2(1.0, 1.1)));
+    }
+    col *= 1.0 - vig * u_vigStr;
+  }
+
+  /* ── Transitions ────────────────────────────────────── */
+  col = mix(col, vec3(0.0), u_fade);   /* black fade  (mode swap) */
+  col = mix(col, vec3(1.0), u_flash);  /* white flash (lens swap) */
+
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+/* ─── Compile + link ───────────────────────────────────────── */
+function mkShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, mkShader(gl.VERTEX_SHADER,   VS));
+gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+  throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+/* cache uniform locations */
+const U = {};
+['u_tex','u_texSize','u_vidAspect','u_scrAspect',
+ 'u_colorMat','u_sat','u_uvI','u_sharp',
+ 'u_vigStr','u_vigSlit','u_fish','u_bloom','u_edge',
+ 'u_mosaic','u_mosaicScale',
+ 'u_fade','u_blur','u_flash'
+].forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+/* ─── Fullscreen quad ──────────────────────────────────────── */
+const vbuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+/* ─── Texture helpers ──────────────────────────────────────── */
+function mkTex() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  return t;
+}
+
+function upload(tex, src) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, src);
+}
+
+/* gradient canvas — shown while video files aren't loaded */
+function mkGradCanvas(inner, outer) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 512;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(256, 220, 20, 256, 256, 340);
+  g.addColorStop(0, inner);
+  g.addColorStop(1, outer);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 512, 512);
+  return c;
+}
+
+/* ─── Mode sources ─────────────────────────────────────────── */
+/*
+  Drop your video files alongside this HTML.
+  Names must match the `file` field below.
+  Serve via local HTTP (e.g. `npx serve .`).
+*/
+const MODE_CFG = {
+  forest:      { file: 'forest.mp4',  grad: ['#4f7e30','#0b1d0a'] },
+  ocean:       { file: 'ocean.mp4',   grad: ['#1a5090','#04091e'] },
+  savanna:     { file: 'savanna.mp4', grad: ['#c07228','#2c1606'] },
+  arctic:      { file: 'arctic.mp4',  grad: ['#c0d4e4','#283848'] },
+  passthrough: { file: null,          grad: ['#282828','#0e0e0e'] },
+};
+
+const srcs = {};
+
+for (const [name, cfg] of Object.entries(MODE_CFG)) {
+  const tex = mkTex();
+  upload(tex, mkGradCanvas(cfg.grad[0], cfg.grad[1]));
+  srcs[name] = { tex, vid: null, w: 512, h: 512 };
+
+  if (cfg.file) {
+    const v = document.createElement('video');
+    v.src = cfg.file;
+    v.loop = v.muted = v.playsInline = true;
+    v.crossOrigin = 'anonymous';
+    v.addEventListener('error', () =>
+      console.warn(`${cfg.file} not found — using gradient placeholder`));
+    v.load();
+    srcs[name].vid = v;
+  }
+}
+
+/* webcam for passthrough mode */
+async function startWebcam() {
+  if (srcs.passthrough.vid) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    const v = document.createElement('video');
+    v.srcObject = stream;
+    v.muted = v.playsInline = true;
+    await v.play();
+    srcs.passthrough.vid = v;
+  } catch (e) {
+    console.warn('Webcam unavailable:', e.message);
+  }
+}
+
+/* ─── Filter presets ───────────────────────────────────────── */
+/*
+  colorMat: 9-element column-major mat3 for gl.uniformMatrix3fv(loc, false, …)
+  GLSL evaluates: result = colorMat * inputRGB
+
+  Column layout: [col0.rgb, col1.rgb, col2.rgb]
+  So result.r = col0[0]*R + col1[0]*G + col2[0]*B
+     result.g = col0[1]*R + col1[1]*G + col2[1]*B
+     result.b = col0[2]*R + col1[2]*G + col2[2]*B
+*/
+const PRESETS = {
+  human: {
+    label: 'HUMAN VISION',
+    colorMat: [
+      1.0, 0.0, 0.0,
+      0.0, 1.0, 0.0,
+      0.0, 0.0, 1.0,
+    ],
+    sat: 1.0, uvI: 0.00, sharp: 0.00,
+    vigStr: 0.00, vigSlit: 0, fish: 0.00, bloom: 0.00, edge: 0.00,
+    mosaic: 0.00, mosaicScale: 18.0,
+  },
+
+  dog: {
+    label: 'DOG VISION',
+    // Dichromat: reds appear olive/brown, world is blue-yellow
+    colorMat: [
+      0.367, 0.280, 0.0,
+      0.280, 0.530, 0.0,
+      0.0,   0.0,   1.0,
+    ],
+    sat: 0.78, uvI: 0.00, sharp: 0.00,
+    vigStr: 0.35, vigSlit: 0, fish: 0.00, bloom: 0.00, edge: 0.00,
+    mosaic: 0.00, mosaicScale: 18.0,
+  },
+
+  eagle: {
+    label: 'EAGLE VISION',
+    colorMat: [
+       1.05, -0.03, -0.02,
+      -0.03,  1.05, -0.02,
+      -0.02, -0.02,  1.05,
+    ],
+    sat: 1.18, uvI: 0.45, sharp: 0.82,
+    vigStr: 0.15, vigSlit: 0, fish: 0.00, bloom: 0.00, edge: 0.00,
+    mosaic: 0.00, mosaicScale: 18.0,
+  },
+
+  cat: {
+    label: 'CAT VISION',
+    /*
+      Intended row-major operation:
+        R_out = 0.55·R                        (reds dimmed)
+        G_out = 0.15·R + 1.05·G + 0.05·B     (green world, slight dichromat bleed)
+        B_out = 0.05·R + 0.10·G + 1.15·B     (blues boosted)
+
+      Column-major for WebGL (transpose of the above):
+        col0 = (0.55, 0.15, 0.05)  — R input's contribution to (R,G,B)
+        col1 = (0.00, 1.05, 0.10)  — G input's contribution
+        col2 = (0.00, 0.05, 1.15)  — B input's contribution
+    */
+    colorMat: [
+      0.55, 0.15, 0.05,
+      0.00, 1.05, 0.10,
+      0.00, 0.05, 1.15,
+    ],
+    sat: 0.85, uvI: 0.00, sharp: 0.00,
+    vigStr: 0.88, vigSlit: 1, fish: 0.07, bloom: 0.65, edge: 0.50,
+    mosaic: 0.00, mosaicScale: 18.0,
+  },
+
+  bee: {
+    label: 'BEE VISION',
+    // Trichromat shifted to UV: reds suppressed, blues/violet boosted
+    colorMat: [
+      0.10, 0.10, 0.05,
+      0.55, 0.85, 0.10,
+      0.10, 0.20, 1.10,
+    ],
+    sat: 1.10, uvI: 0.55, sharp: 0.00,
+    vigStr: 0.50, vigSlit: 0, fish: 0.22, bloom: 0.00, edge: 0.00,
+    mosaic: 0.72, mosaicScale: 38.0,
+  },
+};
+
+/* ─── State ────────────────────────────────────────────────── */
+let curFilter = 'human';
+let curMode   = 'forest';
+
+/* filter transition */
+let fxFrom = null, fxTo = null, fxT = 1.0;
+const FX_DUR = 0.40;
+
+/* mode fade */
+let modePhase = 'idle';   /* 'idle' | 'out' | 'in' */
+let modeT     = 0.0;
+let pendingMode = null;
+const FADE_DUR = 0.28;
+
+/* live uniforms */
+let uFade = 0, uBlur = 0, uFlash = 0;
+
+/* ─── Math helpers ─────────────────────────────────────────── */
+const lerp    = (a, b, t) => a + (b - a) * t;
+const clamp01 = x => Math.max(0, Math.min(1, x));
+const ease    = t => t < 0.5 ? 2*t*t : -1 + (4 - 2*t)*t;
+
+function lerpPreset(a, b, t) {
+  const r = {};
+  for (const k of Object.keys(a)) {
+    if (k === 'label') { r[k] = a[k]; continue; }
+    r[k] = Array.isArray(a[k])
+      ? a[k].map((v, i) => lerp(v, b[k][i], t))
+      : lerp(a[k], b[k], t);
+  }
+  return r;
+}
+
+function getCurrentPreset() {
+  return fxT < 1.0
+    ? lerpPreset(fxFrom, fxTo, ease(fxT))
+    : PRESETS[curFilter];
+}
+
+/* ─── Input ────────────────────────────────────────────────── */
+const labelEl = document.getElementById('label');
+let labelTimer = null;
+
+function showLabel(text) {
+  clearTimeout(labelTimer);
+  labelEl.textContent = text;
+  labelEl.classList.add('show');
+  labelTimer = setTimeout(() => labelEl.classList.remove('show'), 1900);
+}
+
+function switchFilter(name) {
+  if (fxT < 1.0 || name === curFilter) return;
+  fxFrom = getCurrentPreset();
+  fxTo   = PRESETS[name];
+  fxT    = 0.0;
+  curFilter = name;
+  showLabel(PRESETS[name].label);
+}
+
+function switchMode(name) {
+  if (modePhase !== 'idle' || name === curMode) return;
+  if (name === 'passthrough') startWebcam();
+  pendingMode = name;
+  modePhase   = 'out';
+  modeT       = 0.0;
+}
+
+const MODE_ORDER = ['forest', 'ocean', 'savanna', 'arctic', 'passthrough'];
+
+document.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  const k = e.key.toUpperCase();
+  if (k === '1') switchFilter('human');
+  if (k === '2') switchFilter('dog');
+  if (k === '3') switchFilter('eagle');
+  if (k === '4') switchFilter('cat');
+  if (k === '5') switchFilter('bee');
+  if (k === 'Q') switchMode('forest');
+  if (k === 'W') switchMode('ocean');
+  if (k === 'E') switchMode('savanna');
+  if (k === 'R') switchMode('arctic');
+  if (k === 'T') switchMode('passthrough');
+  if (e.key === 'ArrowRight') {
+    const i = MODE_ORDER.indexOf(curMode);
+    switchMode(MODE_ORDER[(i + 1) % MODE_ORDER.length]);
+  }
+  if (e.key === 'ArrowLeft') {
+    const i = MODE_ORDER.indexOf(curMode);
+    switchMode(MODE_ORDER[(i - 1 + MODE_ORDER.length) % MODE_ORDER.length]);
+  }
+});
+
+/* ─── Autoplay (needs user gesture in some browsers) ──────── */
+function tryPlay(name) {
+  const s = srcs[name];
+  if (s.vid && s.vid.paused) s.vid.play().catch(() => {});
+}
+tryPlay('forest');
+document.addEventListener('click',   () => tryPlay(curMode), { once: true });
+document.addEventListener('keydown', () => tryPlay(curMode), { once: true });
+
+/* ─── Render loop ──────────────────────────────────────────── */
+let lastT = null;
+
+function render(now) {
+  requestAnimationFrame(render);
+  const dt = lastT !== null ? clamp01((now - lastT) / 1000) : 0;
+  lastT = now;
+
+  /* ── Mode fade ──────────────────────────────────────── */
+  if (modePhase === 'out') {
+    modeT  = clamp01(modeT + dt / FADE_DUR);
+    uFade  = ease(modeT);
+    if (modeT >= 1.0) {
+      curMode   = pendingMode;
+      modePhase = 'in';
+      modeT     = 0.0;
+      tryPlay(curMode);
+    }
+  } else if (modePhase === 'in') {
+    modeT  = clamp01(modeT + dt / FADE_DUR);
+    uFade  = 1.0 - ease(modeT);
+    if (modeT >= 1.0) { modePhase = 'idle'; uFade = 0; }
+  }
+
+  /* ── Filter transition blur + flash ─────────────────── */
+  if (fxT < 1.0) {
+    fxT   = clamp01(fxT + dt / FX_DUR);
+    // blur: triangle peak at t = 0.5
+    uBlur  = (1.0 - Math.abs(fxT - 0.5) * 2.0) * 0.88;
+    // flash: peaks sharply around t = 0.45
+    const ft = (fxT - 0.30) / 0.35;
+    uFlash = Math.max(0, 1.0 - Math.abs(ft * 2 - 1)) * 0.44;
+  } else {
+    uBlur = uFlash = 0;
+  }
+
+  /* ── Upload current video frame to texture ───────────── */
+  const src = srcs[curMode];
+  if (src.vid && src.vid.readyState >= 2) {
+    upload(src.tex, src.vid);
+    if (src.vid.videoWidth)  src.w = src.vid.videoWidth;
+    if (src.vid.videoHeight) src.h = src.vid.videoHeight;
+  }
+
+  /* ── Set uniforms ────────────────────────────────────── */
+  const p = getCurrentPreset();
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, src.tex);
+
+  gl.uniform1i(U.u_tex,       0);
+  gl.uniform2f(U.u_texSize,   src.w, src.h);
+  gl.uniform1f(U.u_vidAspect, src.w / src.h);
+  gl.uniform1f(U.u_scrAspect, W / H);
+
+  gl.uniformMatrix3fv(U.u_colorMat, false, p.colorMat);
+  gl.uniform1f(U.u_sat,     p.sat);
+  gl.uniform1f(U.u_uvI,     p.uvI);
+  gl.uniform1f(U.u_sharp,   p.sharp);
+  gl.uniform1f(U.u_vigStr,  p.vigStr);
+  gl.uniform1f(U.u_vigSlit, p.vigSlit);
+  gl.uniform1f(U.u_fish,    p.fish);
+  gl.uniform1f(U.u_bloom,   p.bloom);
+  gl.uniform1f(U.u_edge,    p.edge);
+  gl.uniform1f(U.u_mosaic,       p.mosaic);
+  gl.uniform1f(U.u_mosaicScale,  p.mosaicScale);
+
+  gl.uniform1f(U.u_fade,  uFade);
+  gl.uniform1f(U.u_blur,  uBlur);
+  gl.uniform1f(U.u_flash, uFlash);
+
+  /* ── Draw ────────────────────────────────────────────── */
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
